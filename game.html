@@ -1,0 +1,615 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>NEON DODGE — one prompt, one game</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  html, body { margin: 0; padding: 0; background: #000; height: 100%; overflow: hidden; }
+  canvas { display: block; width: 100vw; height: 100vh; object-fit: contain; background: #050510; }
+</style>
+</head>
+<body>
+<canvas id="game" width="1920" height="1080"></canvas>
+<script>
+'use strict';
+// NEON DODGE — a tiny browser game written from exactly one prompt:
+//
+//   "Build a tiny browser game in one HTML file: NEON DODGE — fly a little
+//    neon ship with arrow keys or mouse, dodge falling meteors, collect
+//    glowing stars for points, 3 lives, speed ramps up as your score climbs,
+//    bright neon on dark space, instant restart with R, and a demo autopilot
+//    so anyone can watch it play itself."
+//
+// One file, no dependencies, no network, no assets.
+//
+// The simulation is deterministic: every run with the same seed plays out
+// identically when stepped at 60 Hz. `?t=<seconds>` renders the single frame
+// at that time (how the video's gameplay was recorded); `?demo=1` switches
+// on the autopilot, which also restarts by itself after a game over.
+
+// ---------------------------------------------------------------- tuning
+
+const CFG = {
+  w: 1920, h: 1080,
+  shipY: 1080 - 190,
+  baseFall: 340,          // px/s at score 0; +1.6 per point
+  lives: 3,
+  titleHold: 2.4,         // seconds on the title screen
+  overHold: 2.5,          // seconds on game over before demo restarts
+  invuln: 1.6,            // seconds of mercy after a hit
+  starfield: 160,         // background stars
+  seed: 20261122,
+};
+
+// ------------------------------------------------------------------ setup
+
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+const query = new URLSearchParams(location.search);
+const DEMO = query.get('demo') === '1';
+const SHOT_T = query.has('t')
+  ? Math.max(0, parseFloat(query.get('t')) || 0)
+  : null;
+// `?seed=<n>` replays the same game with a different shuffle (testing);
+// without it the fixed seed below makes every run identical.
+const SEED = query.has('seed')
+  ? (parseInt(query.get('seed'), 10) || CFG.seed)
+  : CFG.seed;
+
+// ------------------------------------------------------- seeded randomness
+
+// mulberry32: tiny, fast, repeatable. Same seed -> same run, every time.
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return function () {
+    a |= 0;
+    a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// ------------------------------------------------------------ game state
+
+function makeBackdrop(rng) {
+  const stars = [];
+  for (let i = 0; i < CFG.starfield; i++) {
+    stars.push({
+      x: rng() * CFG.w, y: rng() * CFG.h,
+      z: 0.25 + rng() * 0.75, r: 0.6 + rng() * 1.8,
+    });
+  }
+  return stars;
+}
+
+function newGame(seed) {
+  const rng = mulberry32(seed);
+  return {
+    rng,
+    clock: 0,
+    score: 0,
+    best: 0,
+    lives: CFG.lives,
+    phase: 'title',        // 'title' | 'play' | 'over'
+    phaseT: 0,
+    flash: 0,
+    shake: 0,
+    mercy: 0,              // invulnerability timer
+    level: 0,
+    bannerT: 0,
+    hero: { x: CFG.w / 2, y: CFG.shipY, vx: 0, tilt: 0 },
+    rocks: [],             // meteors
+    gems: [],              // stars to collect
+    sparks: [],            // particles
+    trails: [],            // engine streaks
+    floats: [],            // floating score text
+    dodged: 0,
+    rockTimer: 0,
+    gemTimer: 0,
+    backdrop: makeBackdrop(rng),
+    keys: {},
+    mouseX: null,
+    paused: false,
+  };
+}
+
+// -------------------------------------------------------------- spawning
+
+function fallSpeed(g) { return CFG.baseFall + g.score * 1.6; }
+
+function dropRock(g) {
+  const rng = g.rng;
+  const r = 26 + rng() * 46;
+  const corners = 7 + Math.floor(rng() * 4);
+  const outline = [];
+  for (let i = 0; i < corners; i++) {
+    outline.push({ a: (i / corners) * Math.PI * 2, d: 0.72 + rng() * 0.4 });
+  }
+  g.rocks.push({
+    x: 60 + rng() * (CFG.w - 120), y: -90, r,
+    vy: fallSpeed(g) * (0.75 + rng() * 0.5),
+    vx: (rng() - 0.5) * 90,
+    rot: rng() * Math.PI * 2, vr: (rng() - 0.5) * 2.4,
+    outline, hue: 8 + rng() * 26,
+  });
+}
+
+function dropGem(g) {
+  const rng = g.rng;
+  g.gems.push({
+    x: 70 + rng() * (CFG.w - 140), y: -40, r: 22,
+    vy: fallSpeed(g) * 0.85, phase: rng() * Math.PI * 2,
+  });
+}
+
+function burst(g, x, y, color, n, power) {
+  for (let i = 0; i < n; i++) {
+    const a = g.rng() * Math.PI * 2;
+    const s = (0.3 + g.rng() * 0.7) * power;
+    g.sparks.push({
+      x, y,
+      vx: Math.cos(a) * s, vy: Math.sin(a) * s,
+      life: 0.5 + g.rng() * 0.5, max: 1,
+      color, r: 2 + g.rng() * 4,
+    });
+  }
+}
+
+function floatText(g, x, y, text, color, life) {
+  g.floats.push({ x, y, text, color, life, max: life });
+}
+
+// -------------------------------------------------------------- autopilot
+
+function pilot(g) {
+  // Chase the nearest reachable gem, but dodge any rock in our lane.
+  const hero = g.hero;
+  let target = CFG.w / 2;
+  let bestCost = Infinity;
+  for (const gem of g.gems) {
+    if (gem.y >= hero.y) continue;
+    const cost = Math.abs(gem.x - hero.x) + (hero.y - gem.y) * 0.4;
+    if (cost < bestCost) { bestCost = cost; target = gem.x; }
+  }
+  for (const rock of g.rocks) {
+    const inLane = rock.y > hero.y - 420 && rock.y < hero.y + 60;
+    const tooClose = Math.abs(rock.x - hero.x) < rock.r + 90;
+    if (inLane && tooClose) {
+      const away = rock.r + 130;
+      target = hero.x + (rock.x >= hero.x ? -away : away);
+    }
+  }
+  return Math.max(70, Math.min(CFG.w - 70, target));
+}
+
+// ------------------------------------------------------------------ update
+
+function steerHero(g, dt) {
+  const hero = g.hero;
+  let target = null;
+  if (DEMO) target = pilot(g);
+  else if (g.mouseX !== null) target = g.mouseX;
+  else if (g.keys.ArrowLeft || g.keys.a) target = hero.x - 900 * dt;
+  else if (g.keys.ArrowRight || g.keys.d) target = hero.x + 900 * dt;
+
+  if (target === null) {
+    hero.vx *= 0.8;
+    hero.tilt *= 0.85;
+    return;
+  }
+  const dx = target - hero.x;
+  hero.vx = Math.max(-1400, Math.min(1400, dx * 10));
+  hero.x = Math.max(60, Math.min(CFG.w - 60, hero.x + hero.vx * dt));
+  const lean = dx > 0 ? 0.28 : dx < 0 ? -0.28 : 0;
+  hero.tilt += (lean - hero.tilt) * Math.min(1, dt * 10);
+}
+
+function moveHazards(g, dt) {
+  const hero = g.hero;
+  // Rocks fall, spin and drift; count the ones that slip past.
+  for (let i = g.rocks.length - 1; i >= 0; i--) {
+    const rock = g.rocks[i];
+    rock.y += rock.vy * dt;
+    rock.x += rock.vx * dt;
+    rock.rot += rock.vr * dt;
+    if (rock.y - rock.r <= CFG.h) continue;
+    g.rocks.splice(i, 1);
+    g.dodged += 1;
+    g.score += 1;
+    const screamedPast =
+      Math.abs(rock.x - hero.x) < rock.r + 120 &&
+      rock.y > hero.y - 260 && rock.y < hero.y + 120;
+    if (screamedPast) {
+      g.score += 2;
+      floatText(g, hero.x, hero.y - 80, 'CLOSE! +2', '#7df9ff', 0.9);
+    }
+  }
+  // Gems drift down and twinkle; the ones that fall off are gone.
+  for (let i = g.gems.length - 1; i >= 0; i--) {
+    const gem = g.gems[i];
+    gem.y += gem.vy * dt;
+    gem.phase += dt * 4;
+    if (gem.y - gem.r > CFG.h) g.gems.splice(i, 1);
+  }
+}
+
+function checkPickups(g) {
+  const hero = g.hero;
+  for (let i = g.gems.length - 1; i >= 0; i--) {
+    const gem = g.gems[i];
+    const dx = gem.x - hero.x, dy = gem.y - hero.y;
+    if (dx * dx + dy * dy >= (gem.r + 34) * (gem.r + 34)) continue;
+    g.gems.splice(i, 1);
+    g.score += 10;
+    burst(g, gem.x, gem.y, '#ffd94a', 14, 260);
+    floatText(g, gem.x, gem.y - 30, '+10', '#ffd94a', 0.8);
+    return; // one pickup per step is plenty
+  }
+}
+
+function checkHits(g) {
+  if (g.mercy > 0) return;
+  const hero = g.hero;
+  for (let i = g.rocks.length - 1; i >= 0; i--) {
+    const rock = g.rocks[i];
+    const dx = rock.x - hero.x, dy = rock.y - hero.y;
+    const reach = rock.r * 0.82 + 30;
+    if (dx * dx + dy * dy >= reach * reach) continue;
+    g.rocks.splice(i, 1);
+    g.lives -= 1;
+    g.mercy = CFG.invuln;
+    g.flash = 0.35;
+    g.shake = 14;
+    burst(g, hero.x, hero.y, '#ff5a3c', 42, 520);
+    burst(g, hero.x, hero.y, '#7df9ff', 20, 340);
+    if (g.lives <= 0) {
+      g.phase = 'over';
+      g.phaseT = 0;
+      g.best = Math.max(g.best, g.score);
+    }
+    return;
+  }
+}
+
+function decayFx(g, dt) {
+  for (let i = g.sparks.length - 1; i >= 0; i--) {
+    const p = g.sparks[i];
+    p.x += p.vx * dt; p.y += p.vy * dt;
+    p.vx *= 0.985; p.vy *= 0.985;
+    p.life -= dt;
+    if (p.life <= 0) g.sparks.splice(i, 1);
+  }
+  for (let i = g.floats.length - 1; i >= 0; i--) {
+    const f = g.floats[i];
+    f.y -= 70 * dt;
+    f.life -= dt;
+    if (f.life <= 0) g.floats.splice(i, 1);
+  }
+  for (let i = g.trails.length - 1; i >= 0; i--) {
+    const t = g.trails[i];
+    t.y += 520 * dt;
+    t.life -= dt;
+    if (t.life <= 0) g.trails.splice(i, 1);
+  }
+  if (g.flash > 0) g.flash -= dt;
+  if (g.shake > 0) g.shake = Math.max(0, g.shake - dt * 30);
+  if (g.bannerT > 0) g.bannerT -= dt;
+  if (g.mercy > 0) g.mercy -= dt;
+}
+
+function resetRun(g) {
+  g.score = 0; g.dodged = 0; g.lives = CFG.lives;
+  g.phase = 'play'; g.phaseT = 0;
+  g.mercy = 0; g.flash = 0;
+  g.rocks.length = 0; g.gems.length = 0;
+  g.sparks.length = 0; g.floats.length = 0; g.trails.length = 0;
+  g.hero.x = CFG.w / 2; g.hero.y = CFG.shipY; g.hero.vx = 0;
+  g.rockTimer = 0.3; g.gemTimer = 0.5;
+}
+
+function update(g, dt) {
+  g.clock += dt;
+
+  if (g.phase === 'title') {
+    g.phaseT += dt;
+    if (g.phaseT > CFG.titleHold) { g.phase = 'play'; g.phaseT = 0; }
+  } else if (g.phase === 'over') {
+    g.phaseT += dt;
+    if (DEMO && g.phaseT > CFG.overHold) resetRun(g);
+  }
+
+  // The backdrop drifts down, slowly, forever.
+  for (const s of g.backdrop) {
+    s.y += 26 * s.z * dt;
+    if (s.y > CFG.h + 4) { s.y = -4; s.x = g.rng() * CFG.w; }
+  }
+
+  if (g.phase === 'play' && !g.paused) {
+    steerHero(g, dt);
+
+    g.rockTimer -= dt;
+    if (g.rockTimer <= 0) {
+      dropRock(g);
+      g.rockTimer = 0.42 + g.rng() * 0.5 - Math.min(0.22, g.score * 0.001);
+    }
+    g.gemTimer -= dt;
+    if (g.gemTimer <= 0) {
+      dropGem(g);
+      g.gemTimer = 0.9 + g.rng() * 1.1;
+    }
+
+    moveHazards(g, dt);
+    checkPickups(g);
+    checkHits(g);
+  }
+
+  // Every 100 points the storm gets faster — flash a banner.
+  const lvl = Math.floor(g.score / 100);
+  if (lvl > g.level) { g.level = lvl; g.bannerT = 1.4; }
+
+  decayFx(g, dt);
+
+  // A fresh engine streak, most steps, while flying.
+  if (g.phase === 'play' && !g.paused && g.rng() < 0.6) {
+    g.trails.push({
+      x: g.hero.x + (g.rng() - 0.5) * 14,
+      y: g.hero.y + 34, life: 0.28, max: 0.28,
+    });
+  }
+}
+
+// ------------------------------------------------------------------ drawing
+
+function drawBackdrop(g) {
+  ctx.fillStyle = '#050510';
+  ctx.fillRect(0, 0, CFG.w, CFG.h);
+  for (const s of g.backdrop) {
+    ctx.globalAlpha = 0.25 + s.z * 0.6;
+    ctx.fillStyle = '#cfe6ff';
+    ctx.beginPath(); ctx.arc(s.x, s.y, s.r, 0, Math.PI * 2); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+  ctx.globalAlpha = 0.10;
+  ctx.fillStyle = '#7b2fff';
+  ctx.beginPath(); ctx.ellipse(330, 260, 420, 200, 0.4, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = '#ff2e88';
+  ctx.beginPath(); ctx.ellipse(1620, 820, 460, 220, -0.3, 0, Math.PI * 2); ctx.fill();
+  ctx.globalAlpha = 1;
+}
+
+function drawGems(g) {
+  for (const gem of g.gems) {
+    const tw = 0.75 + Math.sin(gem.phase) * 0.25;
+    ctx.save();
+    ctx.translate(gem.x, gem.y);
+    ctx.rotate(Math.PI / 4);
+    ctx.shadowColor = '#ffd94a';
+    ctx.shadowBlur = 26 * tw;
+    ctx.fillStyle = '#ffe27a';
+    const r = gem.r * (0.9 + Math.sin(gem.phase) * 0.12);
+    ctx.fillRect(-r * 0.32, -r * 0.32, r * 0.64, r * 0.64);
+    ctx.restore();
+  }
+}
+
+function drawRocks(g) {
+  for (const rock of g.rocks) {
+    ctx.save();
+    ctx.translate(rock.x, rock.y);
+    ctx.rotate(rock.rot);
+    ctx.shadowColor = `hsl(${rock.hue} 100% 55%)`;
+    ctx.shadowBlur = 22;
+    ctx.fillStyle = `hsl(${rock.hue} 85% 52%)`;
+    ctx.beginPath();
+    rock.outline.forEach((v, i) => {
+      const px = Math.cos(v.a) * rock.r * v.d;
+      const py = Math.sin(v.a) * rock.r * v.d;
+      if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+    });
+    ctx.closePath();
+    ctx.fill();
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = 'rgba(0,0,0,0.35)';
+    ctx.beginPath();
+    ctx.arc(-rock.r * 0.2, -rock.r * 0.15, rock.r * 0.45, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  }
+}
+
+function drawHero(g) {
+  if (g.phase === 'over') return;
+  const hero = g.hero;
+  const blink = g.mercy > 0 && Math.floor(g.clock * 12) % 2 === 0;
+  if (blink) return;
+  ctx.save();
+  ctx.translate(hero.x, hero.y);
+  ctx.rotate(hero.tilt);
+  ctx.shadowColor = '#37f4ff';
+  ctx.shadowBlur = 30;
+  ctx.fillStyle = '#9ff7ff';
+  ctx.beginPath();
+  ctx.moveTo(0, -42); ctx.lineTo(30, 30); ctx.lineTo(0, 14); ctx.lineTo(-30, 30);
+  ctx.closePath();
+  ctx.fill();
+  ctx.shadowBlur = 0;
+  ctx.fillStyle = '#ff2e88';
+  ctx.beginPath(); ctx.arc(0, -6, 9, 0, Math.PI * 2); ctx.fill();
+  ctx.restore();
+}
+
+function drawFx(g) {
+  for (const t of g.trails) {
+    ctx.globalAlpha = (t.life / t.max) * 0.8;
+    ctx.fillStyle = '#57e6ff';
+    ctx.fillRect(t.x - 2, t.y, 4, 26);
+  }
+  ctx.globalAlpha = 1;
+  for (const p of g.sparks) {
+    ctx.globalAlpha = Math.max(0, p.life / p.max);
+    ctx.fillStyle = p.color;
+    ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+  ctx.textAlign = 'center';
+  for (const f of g.floats) {
+    ctx.globalAlpha = Math.max(0, f.life / f.max);
+    ctx.fillStyle = f.color;
+    ctx.font = '700 40px "DejaVu Sans", sans-serif';
+    ctx.fillText(f.text, f.x, f.y);
+  }
+  ctx.globalAlpha = 1;
+  if (g.flash > 0) {
+    ctx.fillStyle = `rgba(255,60,50,${Math.min(0.35, g.flash)})`;
+    ctx.fillRect(0, 0, CFG.w, CFG.h);
+  }
+}
+
+function drawHud(g) {
+  ctx.textBaseline = 'alphabetic';
+  ctx.textAlign = 'left';
+  ctx.fillStyle = 'rgba(255,255,255,0.92)';
+  ctx.font = '700 64px "DejaVu Sans", sans-serif';
+  ctx.fillText('SCORE ' + g.score, 48, 92);
+  ctx.font = '700 30px "DejaVu Sans", sans-serif';
+  ctx.fillStyle = 'rgba(160,220,255,0.85)';
+  const mult = (1 + g.score * 0.004).toFixed(1);
+  ctx.fillText('DODGED ' + g.dodged + '   •   SPEED x' + mult, 50, 140);
+
+  // Lives as little hearts, top right.
+  ctx.textAlign = 'right';
+  for (let i = 0; i < CFG.lives; i++) {
+    const x = CFG.w - 70 - i * 62, y = 66;
+    const alive = i < g.lives;
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.shadowColor = alive ? '#ff2e88' : 'transparent';
+    ctx.shadowBlur = alive ? 18 : 0;
+    ctx.fillStyle = alive ? '#ff5c8a' : 'rgba(255,255,255,0.16)';
+    ctx.beginPath();
+    ctx.moveTo(0, 16);
+    ctx.bezierCurveTo(-26, -6, -14, -26, 0, -12);
+    ctx.bezierCurveTo(14, -26, 26, -6, 0, 16);
+    ctx.fill();
+    ctx.restore();
+  }
+  ctx.fillStyle = 'rgba(255,255,255,0.92)';
+  ctx.font = '700 30px "DejaVu Sans", sans-serif';
+  ctx.fillText('BEST ' + Math.max(g.best, g.score), CFG.w - 48, 140);
+
+  if (g.bannerT > 0 && g.phase === 'play') {
+    ctx.textAlign = 'center';
+    ctx.globalAlpha = Math.min(1, g.bannerT);
+    ctx.shadowColor = '#ff2e88';
+    ctx.shadowBlur = 34;
+    ctx.fillStyle = '#ffffff';
+    ctx.font = '700 72px "DejaVu Sans", sans-serif';
+    ctx.fillText('SPEED UP!', CFG.w / 2, 300);
+    ctx.shadowBlur = 0;
+    ctx.globalAlpha = 1;
+  }
+
+  if (g.phase === 'title') {
+    ctx.textAlign = 'center';
+    ctx.shadowColor = '#37f4ff';
+    ctx.shadowBlur = 42;
+    ctx.fillStyle = '#eafcff';
+    ctx.font = '700 150px "DejaVu Sans", sans-serif';
+    ctx.fillText('NEON DODGE', CFG.w / 2, 470);
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = '#ffd94a';
+    ctx.font = '700 44px "DejaVu Sans", sans-serif';
+    ctx.fillText('one prompt  →  one game', CFG.w / 2, 560);
+    ctx.fillStyle = 'rgba(255,255,255,0.85)';
+    ctx.font = '400 34px "DejaVu Sans", sans-serif';
+    const hint = DEMO
+      ? 'autopilot engaged — watch it play itself'
+      : 'arrows / mouse to fly  •  R to restart';
+    ctx.fillText(hint, CFG.w / 2, 640);
+  } else if (g.phase === 'over') {
+    ctx.textAlign = 'center';
+    ctx.shadowColor = '#ff2e63';
+    ctx.shadowBlur = 40;
+    ctx.fillStyle = '#ffe9ef';
+    ctx.font = '700 120px "DejaVu Sans", sans-serif';
+    ctx.fillText('GAME OVER', CFG.w / 2, 480);
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = '#ffd94a';
+    ctx.font = '700 56px "DejaVu Sans", sans-serif';
+    ctx.fillText('SCORE ' + g.score, CFG.w / 2, 580);
+    ctx.fillStyle = 'rgba(255,255,255,0.85)';
+    ctx.font = '400 34px "DejaVu Sans", sans-serif';
+    ctx.fillText(DEMO ? 'restarting…' : 'press R to fly again', CFG.w / 2, 650);
+  }
+
+  if (g.paused && g.phase === 'play') {
+    ctx.textAlign = 'center';
+    ctx.shadowColor = '#37f4ff';
+    ctx.shadowBlur = 30;
+    ctx.fillStyle = '#ffffff';
+    ctx.font = '700 90px "DejaVu Sans", sans-serif';
+    ctx.fillText('PAUSED', CFG.w / 2, CFG.h / 2);
+    ctx.shadowBlur = 0;
+  }
+}
+
+function render(g) {
+  ctx.save();
+  ctx.clearRect(0, 0, CFG.w, CFG.h);
+  if (g.shake > 0.2) {
+    ctx.translate((g.rng() - 0.5) * g.shake, (g.rng() - 0.5) * g.shake);
+  }
+  drawBackdrop(g);
+  drawGems(g);
+  drawRocks(g);
+  drawHero(g);
+  drawFx(g);
+  ctx.restore();
+  drawHud(g);
+}
+
+// ------------------------------------------------------------------- input
+
+const game = newGame(SEED);
+
+addEventListener('keydown', (e) => {
+  game.keys[e.key] = true;
+  if (e.key === 'r' || e.key === 'R') resetRun(game);
+  if (e.key === 'p' || e.key === 'P') game.paused = !game.paused;
+  if (['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', ' '].includes(e.key)) {
+    e.preventDefault();
+  }
+});
+addEventListener('keyup', (e) => { game.keys[e.key] = false; });
+addEventListener('mousemove', (e) => {
+  const r = canvas.getBoundingClientRect();
+  game.mouseX = ((e.clientX - r.left) / r.width) * CFG.w;
+});
+addEventListener('mousedown', () => {
+  if (game.phase === 'title') { game.phase = 'play'; game.phaseT = 0; }
+});
+
+// -------------------------------------------------------------------- boot
+
+if (SHOT_T !== null) {
+  // One deterministic frame: simulate from 0 to t, draw once, stop.
+  const dt = 1 / 60;
+  const steps = Math.round(SHOT_T / dt);
+  for (let i = 0; i < steps; i++) update(game, dt);
+  render(game);
+  document.title = 'shot t=' + SHOT_T;
+} else {
+  let last = performance.now();
+  (function frame(now) {
+    const dt = Math.min(0.05, (now - last) / 1000);
+    last = now;
+    update(game, dt);
+    render(game);
+    requestAnimationFrame(frame);
+  })(last);
+}
+</script>
+</body>
+</html>

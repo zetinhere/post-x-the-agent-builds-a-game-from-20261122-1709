@@ -1,0 +1,7 @@
+# Workdir tooling and artefacts — NOT part of the entry.
+# Only main.ts, POST.json, README.md, PROMPT.md, game.html and LICENSE
+# (written by kit init) are committed.
+video/
+assets/
+out/
+get-codes.mjs
